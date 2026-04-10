@@ -67,6 +67,26 @@ class FakeResponse:
         return 200 <= self.status_code < 300
 
 
+class FakeStreamResponse:
+    def __init__(self, status_code: int, lines=None, text: str = "{}"):
+        self.status_code = status_code
+        self._lines = list(lines or [])
+        self.text = text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aread(self):
+        return self.text.encode("utf-8")
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
 def _build_fake_async_client(handler):
     class FakeAsyncClient:
         def __init__(self, *args, **kwargs):
@@ -80,6 +100,23 @@ def _build_fake_async_client(handler):
 
         async def post(self, url, headers=None, json=None):
             return await handler(headers or {})
+
+    return FakeAsyncClient
+
+
+def _build_fake_stream_async_client(handler):
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            return handler(headers or {})
 
     return FakeAsyncClient
 
@@ -258,6 +295,68 @@ async def test_authenticated_401_retries_next_token_before_guest_fallback(monkey
     assert token_pool.failure_tokens == ["auth-1"]
     assert token_pool.success_tokens == ["auth-2"]
     assert acquire_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_first_chunk_429_retries_next_token_before_returning(
+    monkeypatch,
+):
+    token_pool = StubTokenPool(["auth-1", "auth-2"])
+    guest_pool = await _build_guest_pool(
+        monkeypatch,
+        pool_size=GUEST_POOL_SIZE,
+        user_ids=["guest-1", "guest-2"],
+    )
+    captures: list[dict] = []
+
+    def handler(headers):
+        token = headers["x-token"]
+        if token == "auth-1":
+            return FakeStreamResponse(
+                200,
+                lines=[
+                    (
+                        'data: {"type":"chat:completion","data":{"done":true,'
+                        '"error":{"code":429,"detail":"当前用户对话并发数超过限制,请稍后再试。"}}}'
+                    )
+                ],
+            )
+        return FakeStreamResponse(
+            200,
+            lines=[
+                'data: {"type":"chat:completion","data":{"phase":"answer","delta_content":"ok"}}',
+                'data: {"type":"chat:completion","data":{"done":true}}',
+            ],
+        )
+
+    client = UpstreamClient()
+    _bind_minimal_request_flow(client, captures)
+    _patch_upstream_dependencies(
+        monkeypatch,
+        token_pool=token_pool,
+        guest_pool=guest_pool,
+        async_client_cls=_build_fake_stream_async_client(handler),
+    )
+
+    try:
+        stream = await client.chat_completion(
+            OpenAIRequest(
+                model="GLM-4.5",
+                messages=[Message(role="user", content="ping")],
+                stream=True,
+            )
+        )
+        chunks = []
+        async for chunk in stream:
+            chunks.append(chunk)
+    finally:
+        await guest_pool.close()
+
+    assert [item["token"] for item in captures] == ["auth-1", "auth-2"]
+    assert token_pool.failure_tokens == ["auth-1"]
+    assert token_pool.success_tokens == ["auth-2"]
+    assert any('"content": "ok"' in chunk for chunk in chunks)
+    assert any("[DONE]" in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio

@@ -71,6 +71,15 @@ GLM46V_SELECTED_FEATURES = [
     {"type": "mcp", "server": "vlm-image-processing", "status": "selected"},
 ]
 
+
+class UpstreamStreamChunkError(Exception):
+    """Signal an SSE chunk error before any downstream content was emitted."""
+
+    def __init__(self, message: str, code: Any = None):
+        super().__init__(message)
+        self.message = str(message)
+        self.code = code
+
 def generate_uuid() -> str:
     """生成UUID v4"""
     return str(uuid.uuid4())
@@ -90,7 +99,15 @@ def get_dynamic_headers(
         "safari",
     ]
     selected_browser = browser_type or random.choice(browser_choices)
-    user_agent = get_random_user_agent(selected_browser)
+    if selected_browser == "chrome":
+        # 浏览器指纹参数固定声明为 Windows/Chrome，UA 也必须保持一致。
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        )
+    else:
+        user_agent = get_random_user_agent(selected_browser)
     fe_version = get_latest_fe_version()
 
     chrome_version = "139"
@@ -379,7 +396,7 @@ class UpstreamClient:
             settings.GLM45_SEARCH_MODEL: "0727-360B-API",  # GLM-4.5-Search
             settings.GLM45_AIR_MODEL: "0727-106B-API",  # GLM-4.5-Air
             settings.GLM46V_MODEL: "glm-4.6v",  # GLM-4.6V多模态
-            settings.GLM5_MODEL: "glm-5",  # GLM-5
+            settings.GLM5_MODEL: "GLM-5-Turbo",  # GLM-5
             settings.GLM47_MODEL: "glm-4.7",  # GLM-4.7
             settings.GLM47_THINKING_MODEL: "glm-4.7",  # GLM-4.7-Thinking
             settings.GLM47_SEARCH_MODEL: "glm-4.7",  # GLM-4.7-Search
@@ -622,15 +639,19 @@ class UpstreamClient:
         if upstream_model_id == "glm-4.6v":
             return {
                 "use_persisted_chat": True,
+                "use_browser_fingerprint": True,
+                "accept_wildcard": True,
                 "preview_mode": False,
                 "mcp_servers": list(GLM46V_MCP_SERVERS),
                 "feature_entries": [dict(item) for item in GLM46V_SELECTED_FEATURES],
                 "default_enable_thinking": True,
             }
 
-        if upstream_model_id == "glm-5":
+        if upstream_model_id == "GLM-5-Turbo":
             return {
-                "use_persisted_chat": False,
+                "use_persisted_chat": True,
+                "use_browser_fingerprint": True,
+                "accept_wildcard": True,
                 "preview_mode": True,
                 "mcp_servers": [],
                 "feature_entries": [],
@@ -639,6 +660,8 @@ class UpstreamClient:
 
         return {
             "use_persisted_chat": upstream_model_id == "glm-4.7",
+            "use_browser_fingerprint": upstream_model_id == "glm-4.7",
+            "accept_wildcard": upstream_model_id == "glm-4.7",
             "preview_mode": True,
             "mcp_servers": [],
             "feature_entries": [],
@@ -989,6 +1012,88 @@ class UpstreamClient:
             )
 
         return normalized
+
+    def _extract_chunk_error(
+        self,
+        data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """提取 SSE chunk 中的上游错误信息。"""
+        error = data.get("error")
+        if not isinstance(error, dict):
+            return None
+
+        message = (
+            error.get("detail")
+            or error.get("message")
+            or error.get("msg")
+            or "Unknown upstream error"
+        )
+        code = error.get("code") or "internal_error"
+        return {
+            "error": {
+                "message": str(message),
+                "type": "upstream_error",
+                "code": code,
+            }
+        }
+
+    def _build_glm5_completion_body(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, Any]],
+        prompt: str,
+        chat_id: str,
+        enable_thinking: bool,
+        web_search: bool,
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Any,
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        message_id: str,
+        current_user_message_id: str,
+    ) -> Dict[str, Any]:
+        """构建与当前 Z.ai Web 端一致的 GLM-5 请求体。"""
+        body: Dict[str, Any] = {
+            "stream": True,
+            "model": model,
+            "messages": messages,
+            "signature_prompt": prompt,
+            "params": {},
+            "extra": {},
+            "features": {
+                "image_generation": False,
+                "web_search": web_search,
+                "auto_web_search": web_search,
+                "preview_mode": True,
+                "flags": [],
+                "vlm_tools_enable": False,
+                "vlm_web_search_enable": False,
+                "vlm_website_mode": False,
+                "enable_thinking": enable_thinking,
+            },
+            "variables": self._build_request_variables(),
+            "chat_id": chat_id,
+            "id": message_id,
+            "current_user_message_id": current_user_message_id,
+            "current_user_message_parent_id": None,
+            "background_tasks": {
+                "title_generation": True,
+                "tags_generation": True,
+            },
+        }
+
+        if tools:
+            body["tools"] = tools
+            if tool_choice is not None:
+                body["tool_choice"] = tool_choice
+
+        if temperature is not None:
+            body["params"]["temperature"] = temperature
+        if max_tokens is not None:
+            body["params"]["max_tokens"] = max_tokens
+
+        return body
 
     def _format_search_results(self, data: Dict[str, Any]) -> str:
         """将上游搜索结果格式化为可追加的 Markdown 引用。"""
@@ -1357,6 +1462,8 @@ class UpstreamClient:
             web_search = is_search_model or is_advanced_search
 
         use_persisted_chat = bool(model_profile["use_persisted_chat"])
+        use_browser_fingerprint = bool(model_profile["use_browser_fingerprint"])
+        accept_wildcard = bool(model_profile["accept_wildcard"])
         preview_mode = bool(model_profile["preview_mode"])
         feature_entries = list(model_profile["feature_entries"])
         persisted_user_message_id = generate_uuid() if use_persisted_chat else None
@@ -1368,7 +1475,7 @@ class UpstreamClient:
             self.logger.info("🔍 检测到高级搜索模型，添加 advanced-search MCP 服务器")
 
         headers = get_dynamic_headers(
-            browser_type="chrome" if use_persisted_chat else None,
+            browser_type="chrome" if use_browser_fingerprint else None,
         )
         chat_id = generate_uuid()
 
@@ -1468,7 +1575,11 @@ class UpstreamClient:
                 headers=headers,
                 enable_thinking=enable_thinking,
                 web_search=web_search,
-                user_message_id=persisted_user_message_id,
+                user_message_id=(
+                    None
+                    if upstream_model_id == "GLM-5-Turbo"
+                    else persisted_user_message_id
+                ),
                 files=files or None,
                 feature_entries=feature_entries or None,
                 mcp_servers=mcp_servers or None,
@@ -1476,7 +1587,24 @@ class UpstreamClient:
             self.logger.info(f"🧩 已为 {requested_model} 创建上游 chat: {chat_id}")
         headers["Referer"] = f"{self.base_url}/c/{chat_id}"
 
-        if use_persisted_chat:
+        if upstream_model_id == "GLM-5-Turbo":
+            message_id = generate_uuid()
+            current_user_message_id = generate_uuid()
+            body = self._build_glm5_completion_body(
+                model=upstream_model_id,
+                messages=messages,
+                prompt=last_user_text,
+                chat_id=chat_id,
+                enable_thinking=enable_thinking,
+                web_search=web_search,
+                tools=tools,
+                tool_choice=tool_choice,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                message_id=message_id,
+                current_user_message_id=current_user_message_id,
+            )
+        elif use_persisted_chat:
             body = self._build_glm47_completion_body(
                 model=upstream_model_id,
                 messages=messages,
@@ -1555,7 +1683,7 @@ class UpstreamClient:
                 token=token,
                 user_id=user_id,
                 user_agent=headers["User-Agent"],
-                use_browser_fingerprint=use_persisted_chat,
+                use_browser_fingerprint=use_browser_fingerprint,
             )
             logger.debug(
                 "[上游] 生成签名成功: %s... (user_id=%s, timestamp=%s)",
@@ -1574,7 +1702,7 @@ class UpstreamClient:
             {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                "Accept": "*/*" if use_persisted_chat else "application/json",
+                "Accept": "*/*" if accept_wildcard else "application/json",
                 "X-FE-Version": fe_version,
                 "X-Signature": signature,
             }
@@ -1879,8 +2007,94 @@ class UpstreamClient:
                                 model,
                                 request,
                                 transformed,
+                                raise_on_error=True,
                             ):
                                 yield chunk
+                        except UpstreamStreamChunkError as exc:
+                            chunk_error_code = exc.code
+                            parsed_chunk_error_code = None
+                            if isinstance(chunk_error_code, int):
+                                parsed_chunk_error_code = chunk_error_code
+                            elif (
+                                isinstance(chunk_error_code, str)
+                                and chunk_error_code.isdigit()
+                            ):
+                                parsed_chunk_error_code = int(chunk_error_code)
+
+                            chunk_error_message = exc.message
+                            is_concurrency_limited = self._is_concurrency_limited(
+                                200,
+                                parsed_chunk_error_code,
+                                chunk_error_message,
+                            )
+
+                            if self._should_retry_guest_session(
+                                200,
+                                is_concurrency_limited,
+                                attempt,
+                                max_attempts,
+                                transformed,
+                            ):
+                                guest_user_id = str(
+                                    transformed.get("guest_user_id")
+                                    or transformed.get("user_id")
+                                    or ""
+                                )
+                                if guest_user_id:
+                                    excluded_guest_user_ids.add(guest_user_id)
+                                transformed = await self._refresh_guest_request(
+                                    request,
+                                    attempt,
+                                    excluded_tokens,
+                                    excluded_guest_user_ids,
+                                    transformed,
+                                    is_concurrency_limited=is_concurrency_limited,
+                                )
+                                current_token = str(transformed.get("token") or "")
+                                continue
+
+                            if self._should_retry_authenticated_session(
+                                200,
+                                is_concurrency_limited,
+                                attempt,
+                                max_attempts,
+                                transformed,
+                            ):
+                                if current_token:
+                                    excluded_tokens.add(current_token)
+                                    await self.mark_token_failure(
+                                        current_token,
+                                        Exception(chunk_error_message),
+                                    )
+                                    self.logger.warning(
+                                        "⚠️ 流式首包命中认证会话限制，准备切号/回退匿名池: "
+                                        f"{current_token[:20]}..."
+                                    )
+                                transformed = await self._refresh_authenticated_request(
+                                    request,
+                                    attempt,
+                                    excluded_tokens,
+                                    excluded_guest_user_ids,
+                                )
+                                current_token = str(transformed.get("token") or "")
+                                continue
+
+                            self.logger.error(
+                                "❌ 上游流式响应返回错误: %s",
+                                chunk_error_message,
+                            )
+                            error_response = {
+                                "error": {
+                                    "message": chunk_error_message,
+                                    "type": "upstream_error",
+                                    "code": chunk_error_code or "internal_error",
+                                }
+                            }
+                            yield (
+                                f"data: {json.dumps(error_response, ensure_ascii=False)}\n\n"
+                            )
+                            yield "data: [DONE]\n\n"
+                            return
                         finally:
                             await self._release_guest_session(transformed)
 
@@ -1929,7 +2143,8 @@ class UpstreamClient:
         chat_id: str,
         model: str,
         request: OpenAIRequest,
-        transformed: Dict[str, Any]
+        transformed: Dict[str, Any],
+        raise_on_error: bool = False,
     ) -> AsyncGenerator[str, None]:
         """处理上游流式响应"""
         self.logger.info("✅ 上游响应成功，开始处理 SSE 流")
@@ -2001,6 +2216,9 @@ class UpstreamClient:
                 if not line:
                     continue
 
+                if line_count == 1:
+                    self.logger.info(f"📦 收到首个上游 SSE 片段: {line[:200]}")
+
                 current_line = line.strip()
                 if not current_line.startswith("data:"):
                     continue
@@ -2024,6 +2242,27 @@ class UpstreamClient:
                 data = chunk.get("data", {}) if chunk_type == "chat:completion" else chunk
                 if not isinstance(data, dict):
                     continue
+
+                chunk_error = self._extract_chunk_error(data)
+                if chunk_error:
+                    if (
+                        raise_on_error
+                        and not has_sent_role
+                        and not buffered_content
+                        and not tool_calls_accum
+                    ):
+                        raise UpstreamStreamChunkError(
+                            chunk_error["error"]["message"],
+                            chunk_error["error"].get("code"),
+                        )
+                    self.logger.error(
+                        "❌ 上游流式响应返回错误: %s",
+                        chunk_error["error"]["message"],
+                    )
+                    yield f"data: {json.dumps(chunk_error, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    finished = True
+                    return
 
                 phase = data.get("phase")
                 delta_content = data.get("delta_content", "")
@@ -2127,6 +2366,8 @@ class UpstreamClient:
                     yield final_chunk
 
         except Exception as e:
+            if raise_on_error and isinstance(e, UpstreamStreamChunkError):
+                raise
             self.logger.error(f"❌ 流式响应处理错误: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
@@ -2186,6 +2427,10 @@ class UpstreamClient:
                 data = chunk.get("data", {}) if chunk_type == "chat:completion" else chunk
                 if not isinstance(data, dict):
                     continue
+
+                chunk_error = self._extract_chunk_error(data)
+                if chunk_error:
+                    return chunk_error
 
                 phase = data.get("phase")
                 delta_content = data.get("delta_content", "")
