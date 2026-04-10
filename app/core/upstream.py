@@ -600,17 +600,21 @@ class UpstreamClient:
     def _is_concurrency_limited(
         self,
         status_code: int,
-        error_code: Optional[int],
+        error_code: Any,
         error_message: str,
     ) -> bool:
         """判断是否为上游并发限制/429 场景。"""
         message = (error_message or "").casefold()
+        normalized_error_code = str(error_code or "").strip().casefold()
         return (
             status_code == 429
             or error_code == 429
+            or normalized_error_code == "model_concurrency_limit"
             or "concurrency" in message
             or "too many requests" in message
             or "并发" in error_message
+            or "使用人数较多" in error_message
+            or "稍后再试或切换到其他模型" in error_message
         )
     
     def get_supported_models(self) -> List[str]:
@@ -2080,8 +2084,7 @@ class UpstreamClient:
                                 continue
 
                             self.logger.error(
-                                "❌ 上游流式响应返回错误: %s",
-                                chunk_error_message,
+                                f"❌ 上游流式响应返回错误: {chunk_error_message}"
                             )
                             error_response = {
                                 "error": {
@@ -2256,8 +2259,7 @@ class UpstreamClient:
                             chunk_error["error"].get("code"),
                         )
                     self.logger.error(
-                        "❌ 上游流式响应返回错误: %s",
-                        chunk_error["error"]["message"],
+                        f"❌ 上游流式响应返回错误: {chunk_error['error']['message']}"
                     )
                     yield f"data: {json.dumps(chunk_error, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
